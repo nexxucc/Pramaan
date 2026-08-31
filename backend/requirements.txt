@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+langgraph
+langgraph-checkpoint-sqlite
+litellm
+sqlalchemy
+pydantic
+scikit-learn
+shap
+python-dotenv
