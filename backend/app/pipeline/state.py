@@ -14,3 +14,5 @@ class PipelineState(TypedDict, total=False):
     postcheck_violations: list
     calibrated_score: float
     decision: str  # auto_resolve | escalate | request_evidence
+    human_decision: str  # approve | reject, set by human_review after interrupt() resume
+    human_note: str

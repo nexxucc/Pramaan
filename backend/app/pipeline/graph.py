@@ -1,5 +1,7 @@
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.types import interrupt
+import sqlite3
 
 from app.pipeline.state import PipelineState
 from app.pipeline.nodes.webhook_trigger import webhook_trigger
@@ -10,12 +12,30 @@ from app.pipeline.nodes.compliance_postcheck import compliance_postcheck
 from app.pipeline.nodes.calibrator import calibrator
 from app.pipeline.nodes.router import router
 
-import sqlite3
-
 
 def request_evidence_exit(state: PipelineState) -> PipelineState:
     state["decision"] = "request_evidence"
     return state
+
+
+def human_review(state: PipelineState) -> PipelineState:
+    # Pauses graph execution here. Resume with:
+    #   graph.invoke(Command(resume={"action": "approve"|"reject", "note": "..."}), config)
+    # using the SAME thread_id used for the original invoke() call.
+    human_input = interrupt({
+        "case_id": state["case_id"],
+        "reason_code": state["evidence_bundle"]["reason_code"],
+        "calibrated_score": state["calibrated_score"],
+        "vlm_draft_response": state["vlm_draft_response"],
+        "message": "Escalated for human review. Resume with {'action': 'approve'|'reject', 'note': str}",
+    })
+    state["human_decision"] = human_input.get("action")
+    state["human_note"] = human_input.get("note", "")
+    return state
+
+
+def route_after_router(state: PipelineState) -> str:
+    return "human_review" if state["decision"] == "escalate" else "end"
 
 
 def build_graph():
@@ -29,6 +49,7 @@ def build_graph():
     g.add_node("calibrator", calibrator)
     g.add_node("router", router)
     g.add_node("request_evidence_exit", request_evidence_exit)
+    g.add_node("human_review", human_review)
 
     g.set_entry_point("webhook_trigger")
     g.add_edge("webhook_trigger", "standardize_bundle")
@@ -43,14 +64,16 @@ def build_graph():
     g.add_edge("vlm_propose", "compliance_postcheck")
     g.add_edge("compliance_postcheck", "calibrator")
     g.add_edge("calibrator", "router")
-    g.add_edge("router", END)
+
+    g.add_conditional_edges(
+        "router",
+        route_after_router,
+        {"human_review": "human_review", "end": END},
+    )
+
+    g.add_edge("human_review", END)
     g.add_edge("request_evidence_exit", END)
 
     conn = sqlite3.connect("./pramaan_checkpoints.db", check_same_thread=False)
     checkpointer = SqliteSaver(conn)
     return g.compile(checkpointer=checkpointer)
-
-
-# NOTE: "escalate" decision from router is terminal here.
-# TODO day 2: replace router END edge with interrupt() for the escalate path
-# so a human can act, then resume via graph.invoke(None, config) with same thread_id.
