@@ -7,6 +7,9 @@ from langgraph.types import Command
 
 from app.pipeline.graph import build_graph
 from app.calibrator.explain import explain_case, REASON_CODES
+from app.db.case_repo import upsert_case
+from app.db.session import SessionLocal
+from app.db.models import Case
 
 router = APIRouter()
 graph = build_graph()
@@ -39,6 +42,7 @@ def receive_dispute(payload: dict):
     case_id = str(uuid.uuid4())
     config = {"configurable": {"thread_id": case_id}}
     result = graph.invoke({"case_id": case_id, "raw_payload": payload}, config=config)
+    upsert_case(case_id, result)
     return {"case_id": case_id, "decision": result.get("decision"), "state": result}
 
 
@@ -73,4 +77,25 @@ def resume_case(case_id: str, body: dict):
     """
     config = {"configurable": {"thread_id": case_id}}
     result = graph.invoke(Command(resume=body), config=config)
+    upsert_case(case_id, result)
     return {"case_id": case_id, "state": result}
+
+
+@router.get("/cases")
+def list_cases():
+    db = SessionLocal()
+    try:
+        cases = db.query(Case).order_by(Case.created_at.desc()).all()
+        return [
+            {
+                "case_id": c.id,
+                "reason_code": c.reason_code,
+                "status": c.status,
+                "decision": c.decision,
+                "calibrated_score": c.calibrated_score,
+                "created_at": c.created_at.isoformat() if c.created_at else None,
+            }
+            for c in cases
+        ]
+    finally:
+        db.close()

@@ -11,6 +11,7 @@ from app.pipeline.nodes.vlm_propose import vlm_propose
 from app.pipeline.nodes.compliance_postcheck import compliance_postcheck
 from app.pipeline.nodes.calibrator import calibrator
 from app.pipeline.nodes.router import router
+from app.db.audit import write_audit
 
 
 def request_evidence_exit(state: PipelineState) -> PipelineState:
@@ -19,9 +20,6 @@ def request_evidence_exit(state: PipelineState) -> PipelineState:
 
 
 def human_review(state: PipelineState) -> PipelineState:
-    # Pauses graph execution here. Resume with:
-    #   graph.invoke(Command(resume={"action": "approve"|"reject", "note": "..."}), config)
-    # using the SAME thread_id used for the original invoke() call.
     human_input = interrupt({
         "case_id": state["case_id"],
         "reason_code": state["evidence_bundle"]["reason_code"],
@@ -38,18 +36,34 @@ def route_after_router(state: PipelineState) -> str:
     return "human_review" if state["decision"] == "escalate" else "end"
 
 
+def with_audit(stage_name, fn):
+    """Wraps a node function so every stage writes its input/output to the audit_log table,
+    without touching the individual node files."""
+    def wrapped(state: PipelineState) -> PipelineState:
+        input_snapshot = dict(state)
+        result = fn(state)
+        write_audit(
+            case_id=result.get("case_id", "unknown"),
+            stage=stage_name,
+            input_data=input_snapshot,
+            output_data=dict(result),
+        )
+        return result
+    return wrapped
+
+
 def build_graph():
     g = StateGraph(PipelineState)
 
-    g.add_node("webhook_trigger", webhook_trigger)
-    g.add_node("standardize_bundle", standardize_bundle)
-    g.add_node("completeness_precheck", completeness_precheck)
-    g.add_node("vlm_propose", vlm_propose)
-    g.add_node("compliance_postcheck", compliance_postcheck)
-    g.add_node("calibrator", calibrator)
-    g.add_node("router", router)
-    g.add_node("request_evidence_exit", request_evidence_exit)
-    g.add_node("human_review", human_review)
+    g.add_node("webhook_trigger", with_audit("webhook_trigger", webhook_trigger))
+    g.add_node("standardize_bundle", with_audit("standardize_bundle", standardize_bundle))
+    g.add_node("completeness_precheck", with_audit("completeness_precheck", completeness_precheck))
+    g.add_node("vlm_propose", with_audit("vlm_propose", vlm_propose))
+    g.add_node("compliance_postcheck", with_audit("compliance_postcheck", compliance_postcheck))
+    g.add_node("calibrator", with_audit("calibrator", calibrator))
+    g.add_node("router", with_audit("router", router))
+    g.add_node("request_evidence_exit", with_audit("request_evidence_exit", request_evidence_exit))
+    g.add_node("human_review", with_audit("human_review", human_review))
 
     g.set_entry_point("webhook_trigger")
     g.add_edge("webhook_trigger", "standardize_bundle")
