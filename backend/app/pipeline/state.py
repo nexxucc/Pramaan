@@ -10,6 +10,7 @@ class PipelineState(TypedDict, total=False):
     vlm_validity_score: float
     vlm_draft_response: str
     vlm_citations: list
+    vlm_error: str
     postcheck_passed: bool
     postcheck_violations: list
     calibrated_score: float

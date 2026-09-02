@@ -1,27 +1,69 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
 
-// TODO Day 2: replace with fetch("http://127.0.0.1:8000/api/cases") once DB-backed
-const KNOWN_CASE_IDS = [
-  "2b33c20a-5d02-435d-90ca-8babdc59c607",
-];
+type CaseSummary = {
+  case_id: string;
+  reason_code: string;
+  status: string;
+  decision: string | null;
+  calibrated_score: number | null;
+  created_at: string | null;
+};
 
 export default function CaseListPage() {
+  const [cases, setCases] = useState<CaseSummary[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const [newId, setNewId] = useState("");
+
+  useEffect(() => {
+    fetch("http://127.0.0.1:8000/api/cases")
+      .then((r) => r.json())
+      .then((data) => setCases(data))
+      .catch((e) => setError(String(e)));
+  }, []);
 
   return (
     <main style={{ padding: 32 }}>
       <h1>Pramaan — Cases</h1>
 
-      <ul>
-        {KNOWN_CASE_IDS.map((id) => (
-          <li key={id}>
-            <Link href={`/case/${id}`}>{id}</Link>
-          </li>
-        ))}
-      </ul>
+      {error && <p style={{ color: "crimson" }}>Error loading cases: {error}</p>}
+      {!cases && !error && <p>Loading...</p>}
+      {cases && cases.length === 0 && <p>No cases yet — post a dispute to /api/webhook/dispute.</p>}
+
+      {cases && cases.length > 0 && (
+        <table style={{ borderCollapse: "collapse", width: "100%", marginTop: 16 }}>
+          <thead>
+            <tr style={{ textAlign: "left", borderBottom: "2px solid #333" }}>
+              <th style={{ padding: 8 }}>Case ID</th>
+              <th style={{ padding: 8 }}>Reason</th>
+              <th style={{ padding: 8 }}>Status</th>
+              <th style={{ padding: 8 }}>Router decision</th>
+              <th style={{ padding: 8 }}>Calibrated score</th>
+              <th style={{ padding: 8 }}>Created</th>
+            </tr>
+          </thead>
+          <tbody>
+            {cases.map((c) => (
+              <tr key={c.case_id} style={{ borderBottom: "1px solid #ddd" }}>
+                <td style={{ padding: 8 }}>
+                  <Link href={`/case/${c.case_id}`}>{c.case_id.slice(0, 8)}...</Link>
+                </td>
+                <td style={{ padding: 8 }}>{c.reason_code}</td>
+                <td style={{ padding: 8 }}>{c.status}</td>
+                <td style={{ padding: 8 }}>{c.decision ?? "-"}</td>
+                <td style={{ padding: 8 }}>
+                  {c.calibrated_score != null ? c.calibrated_score.toFixed(3) : "-"}
+                </td>
+                <td style={{ padding: 8 }}>
+                  {c.created_at ? new Date(c.created_at).toLocaleString() : "-"}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
 
       <div style={{ marginTop: 24 }}>
         <input
