@@ -8,6 +8,10 @@ from app.llm.schemas import ProposalOutput
 PROMPT = """You are a dispute evidence auditor. Given this evidence bundle, return ONLY JSON:
 {{"validity_score": float 0-1, "draft_response": string, "citations": [string]}}
 
+Each citation MUST be a bare dotted path into the evidence bundle above, e.g.
+"delivery.delivery_status" or "communication[0]". Do NOT append the value
+(no "= delivered", no ": delivered") and do NOT paraphrase the field name.
+
 Evidence bundle:
 {bundle}
 """

@@ -1,11 +1,20 @@
 from app.pipeline.state import PipelineState
 
-REQUIRED_FIELDS = ["transaction", "delivery"]  # TODO: per reason_code
+DEFAULT_REQUIRED_FIELDS = ["transaction", "delivery"]
+
+REQUIRED_FIELDS_BY_REASON = {
+    "item_not_received": ["transaction", "delivery"],
+    "not_as_described": ["transaction", "delivery", "communication"],
+    "duplicate_charge": ["transaction"],
+    "unauthorized_transaction": ["transaction"],
+    "defective_product": ["transaction", "delivery", "communication"],
+}
 
 
 def completeness_precheck(state: PipelineState) -> PipelineState:
     bundle = state["evidence_bundle"]
-    missing = [f for f in REQUIRED_FIELDS if not bundle.get(f)]
+    required = REQUIRED_FIELDS_BY_REASON.get(bundle.get("reason_code") or "", DEFAULT_REQUIRED_FIELDS)
+    missing = [f for f in required if not bundle.get(f)]
     state["precheck_missing"] = missing
     state["precheck_passed"] = len(missing) == 0
     return state
