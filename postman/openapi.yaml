@@ -1,0 +1,863 @@
+openapi: 3.1.0
+info:
+  title: Pramaan API
+  version: '1.0.0'
+  x-last-documented-commit: bb6c5de70a400d371522c34757b0a3c86a65b48b
+  description: |
+    Pramaan (प्रमाण, "proof") is a chargeback/dispute evidence auditor. A
+    dispute webhook payload runs through a seven-stage LangGraph pipeline —
+    standardize → completeness pre-check → VLM propose → compliance
+    post-check → calibrate → route — and lands on one of three outcomes:
+    `auto_resolve`, `escalate` (paused for human review), or
+    `request_evidence`.
+
+    ## Base URL
+
+    All routes are served directly off the root — there is no version
+    prefix. Health check: `GET /health` (no auth, no dependencies).
+    Everything else is under `/api`.
+
+    ## Authentication
+
+    **None.** This is a hackathon-scope backend with a single trusted
+    caller (Razorpay's webhook, and the bundled frontend). There is no
+    API key, session, or bearer token on any route. Do not deploy this
+    behind a public endpoint without adding auth first — that is a real
+    gap, not an oversight this doc is glossing over.
+
+    ## Request / Response Format
+
+    JSON in, JSON out. No pagination, no rate limiting at the HTTP layer
+    (the LLM call inside `POST /api/webhook/dispute` does its own
+    rate-limit retry/key-rotation against the upstream model provider,
+    invisibly to the caller — a slow response is normal, not a bug).
+
+    ## Error Responses
+
+    This API does not yet use a consistent error envelope. A
+    validation failure on the request body returns FastAPI's default
+    `422` shape (`{"detail": [...]}`). A lookup miss (unknown
+    `case_id`) returns `200` with `{"error": "not found"}` rather than
+    a `404` — this is a known inconsistency, not intentional API
+    design; documented as-is rather than misrepresented.
+
+    ## Pipeline state shape
+
+    `GET /api/cases/{case_id}` and the `state` field on
+    `POST /api/webhook/dispute` / `POST /api/cases/{case_id}/resume`
+    all return the same underlying `PipelineState` object — every field
+    every stage has written so far. Early in the pipeline (e.g. a case
+    that fails the completeness pre-check) most fields simply won't be
+    present yet; this is reflected as an object with a subset of
+    `PipelineState`'s properties, not null placeholders.
+
+    ## Environments
+
+    | Environment | baseUrl |
+    |---|---|
+    | Local dev | `http://127.0.0.1:8000` |
+servers:
+  - url: '{{baseUrl}}'
+    description: Target environment (set baseUrl in your Postman environment)
+tags:
+  - name: health
+    description: Liveness check. No auth, no dependencies on the DB or LLM provider.
+  - name: disputes
+    description: |
+      Ingest a dispute and run it through the full seven-stage pipeline.
+
+      **Auth:** none.
+
+      **Concepts:**
+      - One call to `POST /api/webhook/dispute` runs the *entire* pipeline
+        synchronously — the response already contains the final (or
+        paused-on-escalate) state. There is no separate "check status of
+        an in-flight run" concept; the pipeline either finishes or
+        pauses on `interrupt()` within the same request.
+      - A case that pauses on `escalate` has a `state.__interrupt__` key
+        present in the webhook response — that's the signal to route a
+        human to `POST /api/cases/{case_id}/resume`, not the `decision`
+        field alone (the case list mirrors this via `status: "escalate"`
+        with no `human_decision` yet).
+  - name: metrics
+    description: |
+      Offline evaluation of the calibrator, for the frontend's
+      model-performance view.
+
+      **Auth:** none.
+
+      **Concepts:**
+      - Every number is out-of-sample. The primary figures come from 5-fold
+        stratified out-of-fold cross-validation (each row scored by the one
+        fold-model trained without it); a single stratified 80/20 holdout is
+        reported alongside as an independent check.
+      - The response carries *counts and rupee sums* per candidate threshold,
+        not a cost. The unit costs (chargeback fee, analyst review, evidence
+        request) are the caller's to supply, so the cost model stays visible
+        rather than baked into the API.
+      - Produced by `python -m app.calibrator.evaluate` and cached at
+        `app/calibrator/artifacts/metrics.json`. Regenerate whenever the
+        dataset or the calibrator changes.
+  - name: cases
+    description: |
+      Read and act on cases after they've been created via the webhook.
+
+      **Auth:** none.
+
+      **Concepts:**
+      - `decision` (on a case) is the router's own verdict and never
+        changes after stage 7 runs. `status` (from `GET /api/cases`) is
+        the *current* lifecycle state — it becomes `approved`/`rejected`
+        once a human resumes an escalated case, while `decision` stays
+        `escalate` for audit fidelity.
+      - `request_evidence` is a terminal state today — there is no
+        endpoint to submit more evidence and resume that case.
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      summary: Liveness check
+      tags: [health]
+      description: |
+        Returns a static OK payload. Does not touch the database, the
+        LangGraph checkpointer, or the LLM provider — a 200 here only
+        proves the FastAPI process itself is up.
+
+        **Example:**
+        ```bash
+        curl '{{baseUrl}}/health'
+        ```
+
+        **Response (200):**
+        ```json
+        {"status": "ok"}
+        ```
+      responses:
+        '200':
+          description: Service is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+
+  /api/webhook/dispute:
+    post:
+      operationId: receiveDispute
+      summary: Ingest a dispute and run the full pipeline
+      tags: [disputes]
+      description: |
+        Runs a new case through all seven pipeline stages synchronously:
+        standardize → completeness pre-check → (VLM propose → compliance
+        post-check → calibrate → route) if the pre-check passes. Generates
+        a new `case_id` (UUID) and uses it as the LangGraph thread id, so
+        this same id is what `GET /api/cases/{case_id}` and
+        `POST /api/cases/{case_id}/resume` key off afterward.
+
+        **Pre-conditions:** none — this is the entry point. In production
+        this is called by Razorpay's `payment.dispute.created` webhook;
+        the body below is what standardize_bundle expects to find on it.
+
+        **Business rules:**
+        - `reason_code` drives which evidence fields the completeness
+          pre-check requires (`duplicate_charge` and
+          `unauthorized_transaction` only need `transaction`; the rest
+          also need `delivery`, and `not_as_described` /
+          `defective_product` need `communication` too).
+        - If a required field is missing, the case short-circuits to
+          `decision: "request_evidence"` and the LLM is never called.
+        - If the router decides `escalate`, the response's `state` will
+          contain a `__interrupt__` entry — the pipeline is genuinely
+          paused, not finished.
+
+        **Example:**
+        ```bash
+        curl -X POST '{{baseUrl}}/api/webhook/dispute' \
+          -H 'Content-Type: application/json' \
+          -d '{
+            "dispute_id": "d1",
+            "reason_code": "item_not_received",
+            "transaction": {
+              "transaction_id": "TXN123",
+              "amount": 1500.0,
+              "merchant_category": "Electronics",
+              "sender_bank": "HDFC",
+              "receiver_bank": "ICICI",
+              "fraud_flag": 0,
+              "timestamp": "2026-08-20 10:00:00"
+            },
+            "delivery": {
+              "delivery_partner": "bluedart",
+              "delivery_status": "delivered",
+              "delayed": "no",
+              "delivery_rating": 4.5,
+              "region": "north"
+            },
+            "communication": ["Customer says item never arrived."]
+          }'
+        ```
+
+        **Response (200):**
+        ```json
+        {
+          "case_id": "5e24bae6-3691-410e-a4ad-3794895c4dca",
+          "decision": "escalate",
+          "state": {
+            "case_id": "5e24bae6-3691-410e-a4ad-3794895c4dca",
+            "evidence_bundle": { "...": "..." },
+            "precheck_passed": true,
+            "vlm_validity_score": 0.2,
+            "vlm_citations": ["delivery.delivery_status", "communication[0]"],
+            "postcheck_passed": true,
+            "calibrated_score": 0.124,
+            "decision": "escalate",
+            "__interrupt__": [{ "value": { "message": "Escalated for human review..." } }]
+          }
+        }
+        ```
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DisputeWebhookPayload'
+            example:
+              dispute_id: d1
+              reason_code: item_not_received
+              transaction:
+                transaction_id: TXN123
+                amount: 1500.0
+                merchant_category: Electronics
+                sender_bank: HDFC
+                receiver_bank: ICICI
+                fraud_flag: 0
+                timestamp: '2026-08-20 10:00:00'
+              delivery:
+                delivery_partner: bluedart
+                delivery_status: delivered
+                delayed: 'no'
+                delivery_rating: 4.5
+                region: north
+              communication:
+                - Customer says item never arrived.
+      responses:
+        '200':
+          description: Case created and run through the pipeline (or paused on escalate).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookResponse'
+        '422':
+          description: Request body failed FastAPI's schema validation (e.g. not valid JSON).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationError'
+
+  /api/cases:
+    get:
+      operationId: listCases
+      summary: List all cases (DB-backed summary view)
+      tags: [cases]
+      description: |
+        Reads the `cases` SQL table — one row per case, upserted every
+        time `POST /api/webhook/dispute` or `POST /api/cases/{case_id}/resume`
+        completes. This is a summary view; for the full per-stage state
+        of one case use `GET /api/cases/{case_id}` instead.
+
+        **Pre-conditions:** none.
+
+        **Example:**
+        ```bash
+        curl '{{baseUrl}}/api/cases'
+        ```
+
+        **Response (200):**
+        ```json
+        [
+          {
+            "case_id": "48207a7f-764f-4ceb-9c67-6e654e100c08",
+            "reason_code": "duplicate_charge",
+            "status": "approved",
+            "decision": "escalate",
+            "calibrated_score": 0.1855,
+            "created_at": "2026-09-02T18:07:32.548869"
+          }
+        ]
+        ```
+      responses:
+        '200':
+          description: Array of case summaries, newest first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CaseSummary'
+
+  /api/cases/{case_id}:
+    get:
+      operationId: getCase
+      summary: Get the full pipeline state for one case
+      tags: [cases]
+      description: |
+        Reads the LangGraph checkpointer state for this case's thread id
+        — the authoritative, complete record of everything every stage
+        has written so far, not the (thinner) DB summary row.
+
+        **Pre-conditions:** none.
+
+        **Example:**
+        ```bash
+        curl '{{baseUrl}}/api/cases/{{caseId}}'
+        ```
+
+        **Response (200):**
+        ```json
+        {
+          "case_id": "5e24bae6-3691-410e-a4ad-3794895c4dca",
+          "evidence_bundle": { "...": "..." },
+          "precheck_passed": true,
+          "vlm_validity_score": 0.2,
+          "postcheck_passed": true,
+          "calibrated_score": 0.124,
+          "decision": "escalate",
+          "human_decision": "approve",
+          "human_note": "reviewed, delivery proof sufficient"
+        }
+        ```
+
+        **Response when the case_id is unknown (200 — not 404, see the top-level Error Responses note):**
+        ```json
+        {"error": "not found"}
+        ```
+      parameters:
+        - name: case_id
+          in: path
+          required: true
+          description: UUID returned by `POST /api/webhook/dispute`.
+          schema: { type: string, format: uuid }
+          example: '{{caseId}}'
+      responses:
+        '200':
+          description: 'Full pipeline state, or `{"error": "not found"}` for an unknown case_id.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PipelineState'
+
+  /api/cases/{case_id}/audit:
+    get:
+      operationId: getCaseAudit
+      summary: Per-stage audit trail for one case
+      tags: [cases]
+      description: |
+        Reads the `audit_log` SQL table that the `with_audit` wrapper in
+        `pipeline/graph.py` writes a row to on every node. Oldest first.
+
+        Only the stage name, its timestamp and the keys its output wrote are
+        returned -- the full input/output snapshots are large and already
+        available through `GET /api/cases/{case_id}`.
+
+        **Pre-conditions:** none. An unknown `case_id` returns an empty array,
+        not an error.
+
+        **Example:**
+        ```bash
+        curl '{{baseUrl}}/api/cases/{{caseId}}/audit'
+        ```
+
+        **Response (200):**
+        ```json
+        [
+          {
+            "id": "9e1dc4a0-1f52-4a1e-9a5c-1b0f0a7d3c11",
+            "stage": "webhook_trigger",
+            "created_at": "2026-09-02T18:07:31.902184",
+            "output_keys": ["case_id", "raw_payload"]
+          }
+        ]
+        ```
+      parameters:
+        - name: case_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          example: '{{caseId}}'
+      responses:
+        '200':
+          description: Audit rows for this case, oldest first (empty if the case is unknown).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AuditEntry'
+
+  /api/metrics:
+    get:
+      operationId: getMetrics
+      summary: Full held-out evaluation report
+      tags: [metrics]
+      description: |
+        Headline scores, ROC and precision-recall curves, a reliability curve,
+        the score distribution split by true label, a 101-step threshold sweep,
+        a per-reason-code breakdown, permutation feature importance, and the
+        stated limitations of all of it.
+
+        Served from the cached artifact. Pass `?refresh=true` to recompute from
+        the dataset first -- that refits five fold-models plus a permutation
+        pass and takes a few seconds.
+
+        **Example:**
+        ```bash
+        curl '{{baseUrl}}/api/metrics'
+        ```
+      parameters:
+        - name: refresh
+          in: query
+          required: false
+          description: Recompute instead of serving the cached artifact.
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: The evaluation report.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MetricsReport'
+
+  /api/metrics/summary:
+    get:
+      operationId: getMetricsSummary
+      summary: Headline evaluation numbers only
+      tags: [metrics]
+      description: |
+        The same report with the curve and sweep arrays dropped -- for callers
+        that only want ROC-AUC, PR-AUC, Brier and the operating point.
+
+        **Example:**
+        ```bash
+        curl '{{baseUrl}}/api/metrics/summary'
+        ```
+      responses:
+        '200':
+          description: Dataset, thresholds, CV headline and holdout headline.
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /api/cases/{case_id}/explain:
+    get:
+      operationId: explainCase
+      summary: SHAP explanation for the calibrated score
+      tags: [cases]
+      description: |
+        Runs a `KernelExplainer` against the calibrator model for this
+        one case's feature vector (VLM score, postcheck pass/fail,
+        citation count, one-hot reason code), using a random 30-row
+        sample of the synthetic training set as the SHAP background
+        distribution. Recomputed on every call — not cached.
+
+        **Pre-conditions:** the case must have reached the calibrator
+        stage (i.e. `vlm_validity_score` must be set) — a case that
+        short-circuited at the completeness pre-check has nothing to
+        explain.
+
+        **Example:**
+        ```bash
+        curl '{{baseUrl}}/api/cases/{{caseId}}/explain'
+        ```
+
+        **Response (200):**
+        ```json
+        {
+          "predicted_score": 0.5204,
+          "base_value": 0.161,
+          "contributions": {
+            "vlm_score": 0.379,
+            "postcheck_passed": -0.001,
+            "citations_count": 0.006,
+            "reason_item_not_received": -0.018,
+            "reason_not_as_described": -0.025,
+            "reason_duplicate_charge": 0.009,
+            "reason_unauthorized_transaction": 0.014,
+            "reason_defective_product": -0.006
+          }
+        }
+        ```
+      parameters:
+        - name: case_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          example: '{{caseId}}'
+      responses:
+        '200':
+          description: 'SHAP contribution breakdown, or `{"error": "not found"}`.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Explanation'
+
+  /api/cases/{case_id}/resume:
+    post:
+      operationId: resumeCase
+      summary: Resume an escalated case after human review
+      tags: [cases]
+      description: |
+        Resumes the paused `human_review` node via LangGraph's
+        `Command(resume=...)`. Only meaningful for a case whose
+        `decision` is `escalate` and that hasn't been resumed yet — the
+        graph will re-pause at the same interrupt if you call this on a
+        case that was never escalated.
+
+        **Pre-conditions:** the case must currently be paused at
+        `human_review` (i.e. its last webhook response contained a
+        `__interrupt__` entry).
+
+        **Business rules:**
+        - `action` must be `"approve"` or `"reject"` — anything else is
+          stored as-is in `human_decision` but won't be recognized by
+          `_status_for()`, so the case's `status` (from `GET /api/cases`)
+          will stay whatever the router originally decided instead of
+          flipping to `approved`/`rejected`.
+        - `decision` (the router's original verdict) does not change —
+          only `status` reflects the human outcome.
+
+        **Example:**
+        ```bash
+        curl -X POST '{{baseUrl}}/api/cases/{{caseId}}/resume' \
+          -H 'Content-Type: application/json' \
+          -d '{"action": "approve", "note": "reviewed, delivery proof sufficient"}'
+        ```
+
+        **Response (200):**
+        ```json
+        {
+          "case_id": "5e24bae6-3691-410e-a4ad-3794895c4dca",
+          "state": {
+            "decision": "escalate",
+            "human_decision": "approve",
+            "human_note": "reviewed, delivery proof sufficient"
+          }
+        }
+        ```
+      parameters:
+        - name: case_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          example: '{{caseId}}'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResumeRequest'
+            example:
+              action: approve
+              note: reviewed, delivery proof sufficient
+      responses:
+        '200':
+          description: Final state after resume.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  case_id: { type: string, format: uuid }
+                  state: { $ref: '#/components/schemas/PipelineState' }
+
+components:
+  schemas:
+    ReasonCode:
+      type: string
+      enum:
+        - item_not_received
+        - not_as_described
+        - duplicate_charge
+        - unauthorized_transaction
+        - defective_product
+    Decision:
+      type: [string, 'null']
+      enum: [auto_resolve, escalate, request_evidence, null]
+
+    DisputeWebhookPayload:
+      type: object
+      required: [dispute_id, reason_code]
+      description: |
+        Shape standardize_bundle expects. Every field is read with
+        `.get(..., {})`/`.get(..., [])`, so omitting `transaction`,
+        `delivery`, or `communication` entirely is valid input — it's
+        exactly how the completeness pre-check test cases are built.
+      properties:
+        dispute_id: { type: string, example: d1 }
+        reason_code: { $ref: '#/components/schemas/ReasonCode' }
+        transaction:
+          type: object
+          description: Free-form; the model reads specific keys (amount, timestamps, bank codes) but nothing is enforced at this layer.
+        delivery:
+          type: object
+          description: Free-form delivery evidence (status, partner, rating, region, etc).
+        communication:
+          type: array
+          items: { type: string }
+          description: Raw customer/merchant communication snippets.
+
+    WebhookResponse:
+      type: object
+      properties:
+        case_id: { type: string, format: uuid }
+        decision: { $ref: '#/components/schemas/Decision' }
+        state: { $ref: '#/components/schemas/PipelineState' }
+
+    CaseSummary:
+      type: object
+      description: One row from the `cases` SQL table (db/case_repo.py::upsert_case).
+      properties:
+        case_id: { type: string, format: uuid }
+        reason_code: { $ref: '#/components/schemas/ReasonCode' }
+        status:
+          type: string
+          description: Current lifecycle state — the router's decision, or `approved`/`rejected` once a human has resumed an escalated case.
+          example: approved
+        decision:
+          description: The router's original verdict. Unlike `status`, this never changes after stage 7 runs.
+          allOf: [{ $ref: '#/components/schemas/Decision' }]
+        calibrated_score: { type: [number, 'null'], format: float }
+        created_at: { type: [string, 'null'], format: date-time }
+
+    PipelineState:
+      type: object
+      description: |
+        Every field is optional in practice — this is a `TypedDict(total=False)`
+        on the backend, and how much of it is populated depends on how
+        far the case got through the pipeline before short-circuiting or
+        pausing.
+      properties:
+        case_id: { type: string, format: uuid }
+        raw_payload: { type: object, description: The original webhook body, unmodified. }
+        evidence_bundle: { type: object, description: Normalized bundle produced by standardize_bundle. }
+        precheck_passed: { type: boolean }
+        precheck_missing:
+          type: array
+          items: { type: string }
+          description: Which required fields (per reason_code) were missing, if precheck_passed is false.
+        vlm_validity_score: { type: number, format: float, minimum: 0, maximum: 1 }
+        vlm_draft_response: { type: string }
+        vlm_citations:
+          type: array
+          items: { type: string }
+          description: Dotted-path citations into evidence_bundle, e.g. "delivery.delivery_status" or "communication[0]".
+        vlm_error:
+          type: string
+          description: Set instead of the vlm_* fields above if the LLM call failed after exhausting all configured keys — the pipeline degrades to a 0.0-confidence case rather than raising.
+        postcheck_passed: { type: boolean }
+        postcheck_violations:
+          type: array
+          items: { type: string }
+          description: Citations that did not resolve to a real path in evidence_bundle.
+        calibrated_score: { type: number, format: float, minimum: 0, maximum: 1 }
+        decision: { $ref: '#/components/schemas/Decision' }
+        human_decision:
+          type: [string, 'null']
+          description: Set after POST /api/cases/{case_id}/resume — "approve" or "reject" by convention, not enforced.
+        human_note: { type: [string, 'null'] }
+        __interrupt__:
+          type: array
+          description: Present only while the case is paused at human_review — LangGraph's interrupt payload.
+          items: { type: object }
+
+    Explanation:
+      type: object
+      properties:
+        predicted_score: { type: number, format: float }
+        base_value:
+          type: number
+          format: float
+          description: The calibrator's average prediction across the SHAP background sample — contributions push the score away from this.
+        contributions:
+          type: object
+          description: One entry per model feature (vlm_score, postcheck_passed, citations_count, reason_<code> one-hot columns) — signed SHAP value.
+          additionalProperties: { type: number, format: float }
+
+    ResumeRequest:
+      type: object
+      required: [action]
+      properties:
+        action:
+          type: string
+          description: 'Not validated against an enum server-side — "approve" and "reject" are convention, not enforcement (see the endpoint description).'
+          example: approve
+        note:
+          type: string
+          example: reviewed, delivery proof sufficient
+
+    AuditEntry:
+      type: object
+      description: One row of the `audit_log` table, trimmed for the wire.
+      properties:
+        id: { type: string, format: uuid }
+        stage:
+          type: string
+          description: Node name, e.g. `vlm_propose`, `router`, `human_review`.
+        created_at: { type: [string, 'null'], format: date-time }
+        output_keys:
+          type: array
+          items: { type: string }
+          description: Sorted keys present on that stage's output state.
+
+    PointMetrics:
+      type: object
+      description: Confusion counts and derived rates at one threshold.
+      properties:
+        threshold: { type: number, format: float }
+        tp: { type: integer }
+        fp: { type: integer }
+        tn: { type: integer }
+        fn: { type: integer }
+        precision: { type: number, format: float }
+        recall: { type: number, format: float }
+        f1: { type: number, format: float }
+        specificity: { type: number, format: float }
+        fpr: { type: number, format: float }
+        accuracy: { type: number, format: float }
+
+    SweepRow:
+      allOf:
+        - $ref: '#/components/schemas/PointMetrics'
+        - type: object
+          description: |
+            One candidate auto-resolve threshold, with the escalate threshold
+            held at its learned value. Rupee sums come from the dispute amounts
+            in the dataset, so a cost model can be applied client-side without
+            assuming an average ticket size.
+          properties:
+            n_auto: { type: integer }
+            n_escalate: { type: integer }
+            n_request_evidence: { type: integer }
+            automation_rate: { type: number, format: float }
+            fp_amount:
+              type: number
+              format: float
+              description: Total value of disputes wrongly auto-resolved at this threshold.
+            tp_amount: { type: number, format: float }
+            fn_amount:
+              type: number
+              format: float
+              description: Total value of valid disputes that did not clear the bar.
+
+    MetricsReport:
+      type: object
+      properties:
+        generated_at: { type: string, format: date-time }
+        method:
+          type: object
+          description: How the numbers were produced -- model spec, CV scheme, random_state.
+        dataset:
+          type: object
+          description: Row count, class balance, feature names, amount totals, label meaning.
+        thresholds:
+          type: object
+          properties:
+            auto_resolve: { type: number, format: float }
+            escalate: { type: number, format: float }
+            source: { type: string }
+        cv:
+          type: object
+          description: Out-of-fold results -- the primary numbers.
+          properties:
+            roc_auc: { type: number, format: float }
+            pr_auc: { type: number, format: float }
+            brier: { type: number, format: float }
+            baseline_precision:
+              type: number
+              format: float
+              description: Positive base rate -- the precision a random classifier gets.
+            at_operating_point: { $ref: '#/components/schemas/PointMetrics' }
+            roc_curve:
+              type: array
+              items:
+                type: object
+                properties:
+                  fpr: { type: number, format: float }
+                  tpr: { type: number, format: float }
+            pr_curve:
+              type: array
+              items:
+                type: object
+                properties:
+                  recall: { type: number, format: float }
+                  precision: { type: number, format: float }
+            calibration:
+              type: array
+              description: Reliability bins; empty bins are omitted rather than sent as zeros.
+              items:
+                type: object
+                properties:
+                  bin_start: { type: number, format: float }
+                  bin_end: { type: number, format: float }
+                  predicted: { type: number, format: float }
+                  observed: { type: number, format: float }
+                  count: { type: integer }
+            score_distribution:
+              type: array
+              items:
+                type: object
+                properties:
+                  bin_start: { type: number, format: float }
+                  bin_end: { type: number, format: float }
+                  mid: { type: number, format: float }
+                  valid: { type: integer }
+                  invalid: { type: integer }
+            threshold_sweep:
+              type: array
+              items: { $ref: '#/components/schemas/SweepRow' }
+            per_reason:
+              type: array
+              items:
+                allOf:
+                  - $ref: '#/components/schemas/PointMetrics'
+                  - type: object
+                    properties:
+                      reason_code: { $ref: '#/components/schemas/ReasonCode' }
+                      n: { type: integer }
+                      positive_rate: { type: number, format: float }
+                      roc_auc:
+                        type: [number, 'null']
+                        format: float
+                        description: Null when the slice holds only one class -- reported as unknown rather than 0.5.
+        holdout:
+          type: object
+          description: Independent stratified 80/20 split, for a second opinion on the CV headline.
+        feature_importance:
+          type: array
+          items:
+            type: object
+            properties:
+              feature: { type: string }
+              importance:
+                type: number
+                format: float
+                description: Mean drop in ROC-AUC when this feature is shuffled.
+              std: { type: number, format: float }
+        limitations:
+          type: array
+          items: { type: string }
+          description: What these numbers do not cover, stated in the payload rather than left implicit.
+
+    ValidationError:
+      type: object
+      description: FastAPI's default 422 shape.
+      properties:
+        detail:
+          type: array
+          items:
+            type: object
+            properties:
+              loc: { type: array, items: {} }
+              msg: { type: string }
+              type: { type: string }

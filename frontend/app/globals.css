@@ -1,0 +1,154 @@
+@import "tailwindcss";
+
+/* ── Design tokens ────────────────────────────────────────────────────────
+   One neutral ramp, one accent, four semantic hues mapped to the four
+   things this product ever says: auto-resolve, escalate, request evidence,
+   and "something failed". Nothing else gets a colour.                     */
+
+:root {
+  --bg: #fbfbfc;
+  --surface: #ffffff;
+  --surface-2: #f6f7f9;
+  --border: #e5e7eb;
+  --border-strong: #d1d5db;
+  --text: #111318;
+  --text-muted: #6b7280;
+  --text-faint: #9ca3af;
+
+  --accent: #3d5afe;
+  --accent-soft: #eef1ff;
+
+  --ok: #0f9d70;
+  --ok-soft: #e7f6f0;
+  --warn: #c98a00;
+  --warn-soft: #fdf5e3;
+  --info: #4b6bcd;
+  --info-soft: #eef2fd;
+  --bad: #d3455b;
+  --bad-soft: #fdedef;
+
+  --grid: #eceef1;
+  --shadow: 0 1px 2px rgba(16, 18, 24, 0.04), 0 1px 1px rgba(16, 18, 24, 0.03);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0c0d10;
+    --surface: #131519;
+    --surface-2: #191c21;
+    --border: #24272e;
+    --border-strong: #333741;
+    --text: #e9eaed;
+    --text-muted: #9aa1ad;
+    --text-faint: #6b7280;
+
+    --accent: #7f92ff;
+    --accent-soft: #1a1f3d;
+
+    --ok: #34c99a;
+    --ok-soft: #10241e;
+    --warn: #e0aa38;
+    --warn-soft: #241d0e;
+    --info: #7f9bf0;
+    --info-soft: #141a2e;
+    --bad: #f0697e;
+    --bad-soft: #2a1319;
+
+    --grid: #212429;
+    --shadow: none;
+  }
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-line: var(--border);
+  --color-line-strong: var(--border-strong);
+  --color-ink: var(--text);
+  --color-muted: var(--text-muted);
+  --color-faint: var(--text-faint);
+  --color-accent: var(--accent);
+  --color-accent-soft: var(--accent-soft);
+  --color-ok: var(--ok);
+  --color-ok-soft: var(--ok-soft);
+  --color-warn: var(--warn);
+  --color-warn-soft: var(--warn-soft);
+  --color-info: var(--info);
+  --color-info-soft: var(--info-soft);
+  --color-bad: var(--bad);
+  --color-bad-soft: var(--bad-soft);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+html,
+body {
+  background: var(--bg);
+  color: var(--text);
+}
+
+body {
+  font-family: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+}
+
+/* Tabular figures everywhere a number can change between renders, so
+   columns of numbers never shimmy. */
+.num {
+  font-variant-numeric: tabular-nums;
+  font-family: var(--font-geist-mono), ui-monospace, monospace;
+}
+
+::selection {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+/* Scrollbars: visible enough to grab, quiet enough to ignore. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+.recharts-cartesian-axis-tick text {
+  fill: var(--text-faint);
+  font-size: 11px;
+}
+
+/* Recharts makes .recharts-wrapper focusable, and the default outline sits
+   awkwardly around the whole chart box. Drop it for pointer focus only --
+   keyboard users keep a visible ring. */
+.recharts-surface:focus:not(:focus-visible),
+.recharts-wrapper:focus:not(:focus-visible) {
+  outline: none;
+}
+
+.recharts-surface:focus-visible,
+.recharts-wrapper:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+@keyframes fade-rise {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.rise {
+  animation: fade-rise 0.28s ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rise {
+    animation: none;
+  }
+}
