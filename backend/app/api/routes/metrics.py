@@ -18,6 +18,7 @@ from app.calibrator import evaluate
 router = APIRouter()
 
 _cache: dict | None = None
+_cache_mtime: float | None = None
 
 # A refresh fits five fold-models and runs a permutation pass, then rewrites
 # the shared artifact. Two of those in flight at once burn CPU twice over and
@@ -27,18 +28,32 @@ _refresh_lock = threading.Lock()
 
 
 def _read_cached() -> dict | None:
-    global _cache
-    if _cache is not None:
+    global _cache, _cache_mtime
+
+    try:
+        mtime = os.path.getmtime(evaluate.METRICS_OUT)
+    except OSError:
+        return None
+
+    if _cache is not None and _cache_mtime == mtime:
         return _cache
-    if os.path.exists(evaluate.METRICS_OUT):
+
+    try:
         with open(evaluate.METRICS_OUT, encoding="utf-8") as f:
-            _cache = json.load(f)
-        return _cache
-    return None
+            loaded = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        _cache = None
+        _cache_mtime = None
+        return None
+
+    _cache = loaded
+    _cache_mtime = mtime
+    return _cache
 
 
 def _load(refresh: bool = False) -> dict:
-    global _cache
+    global _cache, _cache_mtime
+
     if not refresh:
         cached = _read_cached()
         if cached is not None:
@@ -49,13 +64,19 @@ def _load(refresh: bool = False) -> dict:
         # waited; serve its result rather than repeating the work.
         if not refresh and _cache is not None:
             return _cache
+
         computed = evaluate.compute()
         os.makedirs(os.path.dirname(evaluate.METRICS_OUT), exist_ok=True)
+
         tmp = f"{evaluate.METRICS_OUT}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(computed, f, indent=2)
+
         os.replace(tmp, evaluate.METRICS_OUT)
+
         _cache = computed
+        _cache_mtime = os.path.getmtime(evaluate.METRICS_OUT)
+
         return _cache
 
 
@@ -63,7 +84,6 @@ def _load(refresh: bool = False) -> dict:
 def get_metrics(refresh: bool = False):
     """Full evaluation report: headline scores, curves, threshold sweep,
     per-reason-code breakdown, feature importance and stated limitations.
-
     Pass ``?refresh=true`` to recompute from the dataset instead of serving
     the cached artifact.
     """

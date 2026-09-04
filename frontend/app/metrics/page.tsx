@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   Area,
   AreaChart,
@@ -29,13 +29,10 @@ import {
   Stat,
 } from "@/components/ui";
 
-/** Unit costs are operator inputs, not constants baked into the model.
- *  Defaults are order-of-magnitude figures for Indian card/UPI chargebacks;
- *  they are meant to be argued with, which is why they are editable. */
 const DEFAULT_COSTS = {
-  chargebackFee: 750, // network + gateway fee eaten per wrongly auto-resolved dispute
-  analystReview: 250, // fully-loaded cost of one human review
-  evidenceRequest: 80, // ops cost of going back to the merchant for evidence
+  chargebackFee: 750,
+  analystReview: 250,
+  evidenceRequest: 80,
 };
 
 export default function MetricsPage() {
@@ -49,18 +46,15 @@ export default function MetricsPage() {
       .metrics()
       .then((data) => {
         setMetrics(data);
-        setThreshold(data.thresholds.auto_resolve);
+        setThreshold(
+          Math.max(data.thresholds.escalate, data.thresholds.auto_resolve),
+        );
       })
       .catch((e) => setError(String(e)));
   }, []);
 
-  // Memoized so the derived useMemos below do not see a fresh [] identity on
-  // every render while the metrics artifact is still loading.
   const sweep = useMemo(() => m?.cv.threshold_sweep ?? [], [m]);
 
-  /** Total expected cost of running at one threshold, under the operator's
-   *  unit costs. Money wrongly refunded is counted at its full rupee value;
-   *  everything the model declines to auto-resolve costs human time instead. */
   const costOf = useMemo(
     () => (r: SweepRow) => ({
       wrongRefunds: r.fp_amount,
@@ -133,10 +127,6 @@ export default function MetricsPage() {
     );
   }
 
-  // A successful response with an empty sweep leaves `current` and `deployed`
-  // null forever, which the loading guard below would render as skeletons that
-  // never resolve. Say so instead: the report arrived, it just has no
-  // operating points to draw.
   if (m && !sweep.length) {
     return (
       <>
@@ -412,11 +402,14 @@ export default function MetricsPage() {
                   active && payload?.length ? (
                     <TooltipShell
                       title={`score ≈ ${Number(payload[0].payload.mid).toFixed(2)}`}
-                      rows={payload.map((p) => [
-                        p.name as string,
-                        p.value as number,
-                        p.color,
-                      ])}
+                      rows={payload.map(
+                        (p) =>
+                          [
+                            p.name as string,
+                            p.value as number,
+                            p.color,
+                          ] as [string, ReactNode, string?],
+                      )}
                     />
                   ) : null
                 }
@@ -489,13 +482,15 @@ export default function MetricsPage() {
           <p className="border-t border-line px-5 py-3 text-[11.5px] text-muted">
             Brier score{" "}
             <span className="num text-ink">{m.cv.brier.toFixed(3)}</span> — lower
-            is better; 0.25 is what predicting the base rate for everything would
-            give you.
+            is better; {(
+              m.cv.baseline_precision *
+              (1 - m.cv.baseline_precision)
+            ).toFixed(3)}{" "}
+            is what predicting the base rate for everything would give you.
           </p>
         </Card>
       </div>
 
-      {/* ── False-positive cost explorer ─────────────────────────────── */}
       <Card className="mt-3">
         <CardHeader
           title="What a false positive actually costs"
@@ -519,15 +514,19 @@ export default function MetricsPage() {
               <input
                 id="threshold"
                 type="range"
-                min={0}
+                min={m.thresholds.escalate}
                 max={1}
                 step={0.01}
                 value={threshold}
-                onChange={(e) => setThreshold(Number(e.target.value))}
+                onChange={(e) =>
+                  setThreshold(
+                    Math.max(m.thresholds.escalate, Number(e.target.value)),
+                  )
+                }
                 className="mt-2 w-full accent-[var(--accent)]"
               />
               <div className="mt-1 flex justify-between text-[11px] text-faint">
-                <span>refund everything</span>
+                <span>escalate bar ({m.thresholds.escalate.toFixed(2)})</span>
                 <span>refund nothing</span>
               </div>
               <button
@@ -797,11 +796,14 @@ export default function MetricsPage() {
                 active && payload?.length ? (
                   <TooltipShell
                     title={`threshold ${Number(label).toFixed(2)}`}
-                    rows={payload.map((p) => [
-                      p.name as string,
-                      (p.value as number).toFixed(3),
-                      p.color,
-                    ])}
+                    rows={payload.map(
+                      (p) =>
+                        [
+                          p.name as string,
+                          (p.value as number).toFixed(3),
+                          p.color,
+                        ] as [string, ReactNode, string?],
+                    )}
                   />
                 ) : null
               }

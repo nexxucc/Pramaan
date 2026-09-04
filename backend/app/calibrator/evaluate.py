@@ -40,8 +40,11 @@ from app.calibrator.train import CASES_PATH, REASON_CODES, featurize
 FEATURE_NAMES = ["vlm_score", "postcheck_passed", "citations_count"] + [
     f"reason_{r}" for r in REASON_CODES
 ]
-THRESHOLDS_PATH = os.path.join(os.path.dirname(__file__), "artifacts", "thresholds.json")
-METRICS_OUT = os.path.join(os.path.dirname(__file__), "artifacts", "metrics.json")
+
+THRESHOLDS_PATH = os.path.join(os.path.dirname(
+    __file__), "artifacts", "thresholds.json")
+METRICS_OUT = os.path.join(os.path.dirname(
+    __file__), "artifacts", "metrics.json")
 
 RANDOM_STATE = 42
 N_SPLITS = 5
@@ -59,20 +62,25 @@ def _calibrated():
 def load_dataset():
     """Returns (X, y, meta) where meta carries reason_code + dispute amount per row."""
     X, y, meta = [], [], []
+    n_amount_unparsed = 0
+
     with open(CASES_PATH, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
-            X.append(featurize(row))
-            y.append(int(row["label"]))
             try:
                 amount = float(json.loads(row["transaction"])["amount"])
-            except Exception:
-                amount = 0.0
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                n_amount_unparsed += 1
+                continue
+
+            X.append(featurize(row))
+            y.append(int(row["label"]))
             meta.append({
                 "reason_code": row["reason_code"],
                 "amount": amount,
                 "vlm_score": float(row["vlm_validity_score"]),
             })
-    return np.array(X), np.array(y), meta
+
+    return np.array(X), np.array(y), meta, n_amount_unparsed
 
 
 def _counts_at(y, scores, threshold):
@@ -89,7 +97,8 @@ def _rates(c):
     tp, fp, tn, fn = c["tp"], c["fp"], c["tn"], c["fn"]
     precision = tp / (tp + fp) if tp + fp else 0.0
     recall = tp / (tp + fn) if tp + fn else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    f1 = 2 * precision * recall / \
+        (precision + recall) if precision + recall else 0.0
     return {
         "precision": precision,
         "recall": recall,
@@ -109,7 +118,8 @@ def _curves(y, scores):
     fpr, tpr, roc_thr = roc_curve(y, scores)
     precision, recall, _ = precision_recall_curve(y, scores)
     roc_points = [{"fpr": float(a), "tpr": float(b)} for a, b in zip(fpr, tpr)]
-    pr_points = [{"recall": float(r), "precision": float(p)} for r, p in zip(recall, precision)]
+    pr_points = [{"recall": float(r), "precision": float(p)}
+                 for r, p in zip(recall, precision)]
     return roc_points, pr_points
 
 
@@ -125,7 +135,8 @@ def _calibration(y, scores, n_bins=8):
     out = []
     for i in range(n_bins):
         left, right = edges[i], edges[i + 1]
-        mask = (scores >= left) & (scores <= right if i == n_bins - 1 else scores < right)
+        mask = (scores >= left) & (scores <= right if i ==
+                                   n_bins - 1 else scores < right)
         n = int(mask.sum())
         if n == 0:
             continue
@@ -144,7 +155,8 @@ def _score_distribution(y, scores, n_bins=20):
     out = []
     for i in range(n_bins):
         left, right = edges[i], edges[i + 1]
-        mask = (scores >= left) & (scores <= right if i == n_bins - 1 else scores < right)
+        mask = (scores >= left) & (scores <= right if i ==
+                                   n_bins - 1 else scores < right)
         out.append({
             "bin_start": float(left),
             "bin_end": float(right),
@@ -176,9 +188,11 @@ def _threshold_sweep(y, scores, meta, escalate_threshold):
         escalate = (scores >= escalate_threshold) & ~auto
         request = scores < escalate_threshold
         counts = _counts_at(y, scores, t)
-        auto_wrong = auto & (y == 0)     # auto-resolved a dispute that was not valid
+        # auto-resolved a dispute that was not valid
+        auto_wrong = auto & (y == 0)
         auto_right = auto & (y == 1)
-        missed = ~auto & (y == 1)        # valid dispute that did not clear the bar
+        # valid dispute that did not clear the bar
+        missed = ~auto & (y == 1)
         rows.append({
             "threshold": float(t),
             **counts,
@@ -212,7 +226,8 @@ def _per_reason(y, scores, meta, threshold):
         # fabricated 0.5. duplicate_charge / unauthorized_transaction are
         # expected to land here (near-zero positive base rate by design).
         entry["roc_auc"] = (
-            float(roc_auc_score(y_rc, s_rc)) if len(set(y_rc.tolist())) > 1 else None
+            float(roc_auc_score(y_rc, s_rc)) if len(
+                set(y_rc.tolist())) > 1 else None
         )
         out.append(entry)
     return out
@@ -234,7 +249,8 @@ def _fold_permutation_drops(model, X_te, y_te, rng, n_repeats):
         for _ in range(n_repeats):
             Xp = X_te.copy()
             rng.shuffle(Xp[:, i])
-            per_repeat.append(base - roc_auc_score(y_te, model.predict_proba(Xp)[:, 1]))
+            per_repeat.append(
+                base - roc_auc_score(y_te, model.predict_proba(Xp)[:, 1]))
         drops[name] = per_repeat
     return drops
 
@@ -254,7 +270,8 @@ def _permutation_importance(X, y, cv, n_repeats=10):
     pooled = {name: [] for name in FEATURE_NAMES}
     for train_idx, test_idx in cv.split(X, y):
         model = _calibrated().fit(X[train_idx], y[train_idx])
-        drops = _fold_permutation_drops(model, X[test_idx], y[test_idx], rng, n_repeats)
+        drops = _fold_permutation_drops(
+            model, X[test_idx], y[test_idx], rng, n_repeats)
         if drops is None:
             continue
         for name, values in drops.items():
@@ -272,7 +289,7 @@ def _permutation_importance(X, y, cv, n_repeats=10):
 
 
 def compute() -> dict:
-    X, y, meta = load_dataset()
+    X, y, meta, n_amount_unparsed = load_dataset()
 
     thresholds = {"auto_resolve_threshold": 0.45, "escalate_threshold": 0.15}
     if os.path.exists(THRESHOLDS_PATH):
@@ -281,8 +298,10 @@ def compute() -> dict:
     auto_t = float(thresholds["auto_resolve_threshold"])
     esc_t = float(thresholds["escalate_threshold"])
 
-    cv = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
-    oof = cross_val_predict(_calibrated(), X, y, cv=cv, method="predict_proba")[:, 1]
+    cv = StratifiedKFold(n_splits=N_SPLITS, shuffle=True,
+                         random_state=RANDOM_STATE)
+    oof = cross_val_predict(_calibrated(), X, y, cv=cv,
+                            method="predict_proba")[:, 1]
 
     roc_points, pr_points = _curves(y, oof)
 
@@ -315,6 +334,7 @@ def compute() -> dict:
             "features": FEATURE_NAMES,
             "mean_amount": float(np.mean([m["amount"] for m in meta])),
             "total_amount": float(np.sum([m["amount"] for m in meta])),
+            "n_amount_unparsed": n_amount_unparsed,
             "label_meaning": "1 = valid dispute (merchant at fault), 0 = invalid dispute",
         },
         "thresholds": {
@@ -364,13 +384,16 @@ def main():
         json.dump(metrics, f, indent=2)
     cvm = metrics["cv"]
     op = cvm["at_operating_point"]
-    print(f"n={metrics['dataset']['n']} positive_rate={metrics['dataset']['positive_rate']:.3f}")
-    print(f"CV ROC-AUC {cvm['roc_auc']:.3f}  PR-AUC {cvm['pr_auc']:.3f}  Brier {cvm['brier']:.3f}")
+    print(
+        f"n={metrics['dataset']['n']} positive_rate={metrics['dataset']['positive_rate']:.3f}")
+    print(
+        f"CV ROC-AUC {cvm['roc_auc']:.3f}  PR-AUC {cvm['pr_auc']:.3f}  Brier {cvm['brier']:.3f}")
     print(
         f"@auto_resolve={op['threshold']:.3f}  P {op['precision']:.3f}  R {op['recall']:.3f}  "
         f"F1 {op['f1']:.3f}  FP {op['fp']}  FN {op['fn']}"
     )
-    print(f"Holdout ROC-AUC {metrics['holdout']['roc_auc']:.3f} (n={metrics['holdout']['n']})")
+    print(
+        f"Holdout ROC-AUC {metrics['holdout']['roc_auc']:.3f} (n={metrics['holdout']['n']})")
     print(f"Saved -> {METRICS_OUT}")
 
 

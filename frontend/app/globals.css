@@ -3,8 +3,8 @@
 /* ── Design tokens ────────────────────────────────────────────────────────
    One neutral ramp, one accent, four semantic hues mapped to the four
    things this product ever says: auto-resolve, escalate, request evidence,
-   and "something failed". Nothing else gets a colour.                     */
-
+   and "something failed". Nothing else gets a colour.
+*/
 :root {
   --bg: #fbfbfc;
   --surface: #ffffff;
@@ -13,11 +13,9 @@
   --border-strong: #d1d5db;
   --text: #111318;
   --text-muted: #6b7280;
-  --text-faint: #9ca3af;
-
+  --text-faint: #4b5563;
   --accent: #3d5afe;
   --accent-soft: #eef1ff;
-
   --ok: #0f9d70;
   --ok-soft: #e7f6f0;
   --warn: #c98a00;
@@ -26,7 +24,6 @@
   --info-soft: #eef2fd;
   --bad: #d3455b;
   --bad-soft: #fdedef;
-
   --grid: #eceef1;
   --shadow: 0 1px 2px rgba(16, 18, 24, 0.04), 0 1px 1px rgba(16, 18, 24, 0.03);
 }
@@ -40,11 +37,9 @@
     --border-strong: #333741;
     --text: #e9eaed;
     --text-muted: #9aa1ad;
-    --text-faint: #6b7280;
-
+    --text-faint: #9ca3af;
     --accent: #7f92ff;
     --accent-soft: #1a1f3d;
-
     --ok: #34c99a;
     --ok-soft: #10241e;
     --warn: #e0aa38;
@@ -53,7 +48,6 @@
     --info-soft: #141a2e;
     --bad: #f0697e;
     --bad-soft: #2a1319;
-
     --grid: #212429;
     --shadow: none;
   }
