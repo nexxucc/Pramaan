@@ -4,9 +4,8 @@ import os
 import sys
 import time
 import uuid
-
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
+from app.db.case_repo import upsert_case
 from app.pipeline.graph import build_graph  # noqa: E402
 
 IN_PATH = os.path.join(os.path.dirname(__file__), "..",
@@ -56,6 +55,7 @@ def main():
             try:
                 result = graph.invoke(
                     {"case_id": dispute_id, "raw_payload": payload}, config=config)
+                upsert_case(dispute_id, result)
             except Exception as e:
                 print(f"[{i}] FAILED {dispute_id}: {e}")
                 continue

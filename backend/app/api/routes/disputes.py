@@ -9,7 +9,7 @@ from app.pipeline.graph import build_graph
 from app.calibrator.explain import explain_case, REASON_CODES
 from app.db.case_repo import upsert_case
 from app.db.session import SessionLocal
-from app.db.models import Case
+from app.db.models import Case, AuditLog
 
 router = APIRouter()
 graph = build_graph()
@@ -79,6 +79,36 @@ def resume_case(case_id: str, body: dict):
     result = graph.invoke(Command(resume=body), config=config)
     upsert_case(case_id, result)
     return {"case_id": case_id, "state": result}
+
+
+@router.get("/cases/{case_id}/audit")
+def case_audit(case_id: str):
+    """Per-stage audit trail for one case, oldest first.
+
+    Reads the `audit_log` table that `with_audit` in pipeline/graph.py writes a
+    row to on every node. Only the stage name and timing are returned here --
+    the full input/output snapshots are large and already available through
+    GET /api/cases/{case_id}.
+    """
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(AuditLog)
+            .filter(AuditLog.case_id == case_id)
+            .order_by(AuditLog.created_at.asc())
+            .all()
+        )
+        return [
+            {
+                "id": r.id,
+                "stage": r.stage,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "output_keys": sorted((r.output_data or {}).keys()),
+            }
+            for r in rows
+        ]
+    finally:
+        db.close()
 
 
 @router.get("/cases")

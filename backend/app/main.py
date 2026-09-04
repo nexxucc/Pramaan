@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.db.session import Base, engine
 from app.db import models  # noqa: F401
-from app.api.routes import disputes
+from app.api.routes import disputes, metrics
 
 Base.metadata.create_all(bind=engine)
 
@@ -17,6 +17,7 @@ app.add_middleware(
 )
 
 app.include_router(disputes.router, prefix="/api")
+app.include_router(metrics.router, prefix="/api")
 
 
 @app.get("/health")

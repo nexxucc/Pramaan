@@ -79,6 +79,25 @@ tags:
         human to `POST /api/cases/{case_id}/resume`, not the `decision`
         field alone (the case list mirrors this via `status: "escalate"`
         with no `human_decision` yet).
+  - name: metrics
+    description: |
+      Offline evaluation of the calibrator, for the frontend's
+      model-performance view.
+
+      **Auth:** none.
+
+      **Concepts:**
+      - Every number is out-of-sample. The primary figures come from 5-fold
+        stratified out-of-fold cross-validation (each row scored by the one
+        fold-model trained without it); a single stratified 80/20 holdout is
+        reported alongside as an independent check.
+      - The response carries *counts and rupee sums* per candidate threshold,
+        not a cost. The unit costs (chargeback fee, analyst review, evidence
+        request) are the caller's to supply, so the cost model stays visible
+        rather than baked into the API.
+      - Produced by `python -m app.calibrator.evaluate` and cached at
+        `app/calibrator/artifacts/metrics.json`. Regenerate whenever the
+        dataset or the calibrator changes.
   - name: cases
     description: |
       Read and act on cases after they've been created via the webhook.
@@ -328,6 +347,108 @@ paths:
               schema:
                 $ref: '#/components/schemas/PipelineState'
 
+  /api/cases/{case_id}/audit:
+    get:
+      operationId: getCaseAudit
+      summary: Per-stage audit trail for one case
+      tags: [cases]
+      description: |
+        Reads the `audit_log` SQL table that the `with_audit` wrapper in
+        `pipeline/graph.py` writes a row to on every node. Oldest first.
+
+        Only the stage name, its timestamp and the keys its output wrote are
+        returned -- the full input/output snapshots are large and already
+        available through `GET /api/cases/{case_id}`.
+
+        **Pre-conditions:** none. An unknown `case_id` returns an empty array,
+        not an error.
+
+        **Example:**
+        ```bash
+        curl '{{baseUrl}}/api/cases/{{caseId}}/audit'
+        ```
+
+        **Response (200):**
+        ```json
+        [
+          {
+            "id": "9e1dc4a0-1f52-4a1e-9a5c-1b0f0a7d3c11",
+            "stage": "webhook_trigger",
+            "created_at": "2026-09-02T18:07:31.902184",
+            "output_keys": ["case_id", "raw_payload"]
+          }
+        ]
+        ```
+      parameters:
+        - name: case_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          example: '{{caseId}}'
+      responses:
+        '200':
+          description: Audit rows for this case, oldest first (empty if the case is unknown).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AuditEntry'
+
+  /api/metrics:
+    get:
+      operationId: getMetrics
+      summary: Full held-out evaluation report
+      tags: [metrics]
+      description: |
+        Headline scores, ROC and precision-recall curves, a reliability curve,
+        the score distribution split by true label, a 101-step threshold sweep,
+        a per-reason-code breakdown, permutation feature importance, and the
+        stated limitations of all of it.
+
+        Served from the cached artifact. Pass `?refresh=true` to recompute from
+        the dataset first -- that refits five fold-models plus a permutation
+        pass and takes a few seconds.
+
+        **Example:**
+        ```bash
+        curl '{{baseUrl}}/api/metrics'
+        ```
+      parameters:
+        - name: refresh
+          in: query
+          required: false
+          description: Recompute instead of serving the cached artifact.
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: The evaluation report.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MetricsReport'
+
+  /api/metrics/summary:
+    get:
+      operationId: getMetricsSummary
+      summary: Headline evaluation numbers only
+      tags: [metrics]
+      description: |
+        The same report with the curve and sweep arrays dropped -- for callers
+        that only want ROC-AUC, PR-AUC, Brier and the operating point.
+
+        **Example:**
+        ```bash
+        curl '{{baseUrl}}/api/metrics/summary'
+        ```
+      responses:
+        '200':
+          description: Dataset, thresholds, CV headline and holdout headline.
+          content:
+            application/json:
+              schema:
+                type: object
+
   /api/cases/{case_id}/explain:
     get:
       operationId: explainCase
@@ -574,6 +695,159 @@ components:
         note:
           type: string
           example: reviewed, delivery proof sufficient
+
+    AuditEntry:
+      type: object
+      description: One row of the `audit_log` table, trimmed for the wire.
+      properties:
+        id: { type: string, format: uuid }
+        stage:
+          type: string
+          description: Node name, e.g. `vlm_propose`, `router`, `human_review`.
+        created_at: { type: [string, 'null'], format: date-time }
+        output_keys:
+          type: array
+          items: { type: string }
+          description: Sorted keys present on that stage's output state.
+
+    PointMetrics:
+      type: object
+      description: Confusion counts and derived rates at one threshold.
+      properties:
+        threshold: { type: number, format: float }
+        tp: { type: integer }
+        fp: { type: integer }
+        tn: { type: integer }
+        fn: { type: integer }
+        precision: { type: number, format: float }
+        recall: { type: number, format: float }
+        f1: { type: number, format: float }
+        specificity: { type: number, format: float }
+        fpr: { type: number, format: float }
+        accuracy: { type: number, format: float }
+
+    SweepRow:
+      allOf:
+        - $ref: '#/components/schemas/PointMetrics'
+        - type: object
+          description: |
+            One candidate auto-resolve threshold, with the escalate threshold
+            held at its learned value. Rupee sums come from the dispute amounts
+            in the dataset, so a cost model can be applied client-side without
+            assuming an average ticket size.
+          properties:
+            n_auto: { type: integer }
+            n_escalate: { type: integer }
+            n_request_evidence: { type: integer }
+            automation_rate: { type: number, format: float }
+            fp_amount:
+              type: number
+              format: float
+              description: Total value of disputes wrongly auto-resolved at this threshold.
+            tp_amount: { type: number, format: float }
+            fn_amount:
+              type: number
+              format: float
+              description: Total value of valid disputes that did not clear the bar.
+
+    MetricsReport:
+      type: object
+      properties:
+        generated_at: { type: string, format: date-time }
+        method:
+          type: object
+          description: How the numbers were produced -- model spec, CV scheme, random_state.
+        dataset:
+          type: object
+          description: Row count, class balance, feature names, amount totals, label meaning.
+        thresholds:
+          type: object
+          properties:
+            auto_resolve: { type: number, format: float }
+            escalate: { type: number, format: float }
+            source: { type: string }
+        cv:
+          type: object
+          description: Out-of-fold results -- the primary numbers.
+          properties:
+            roc_auc: { type: number, format: float }
+            pr_auc: { type: number, format: float }
+            brier: { type: number, format: float }
+            baseline_precision:
+              type: number
+              format: float
+              description: Positive base rate -- the precision a random classifier gets.
+            at_operating_point: { $ref: '#/components/schemas/PointMetrics' }
+            roc_curve:
+              type: array
+              items:
+                type: object
+                properties:
+                  fpr: { type: number, format: float }
+                  tpr: { type: number, format: float }
+            pr_curve:
+              type: array
+              items:
+                type: object
+                properties:
+                  recall: { type: number, format: float }
+                  precision: { type: number, format: float }
+            calibration:
+              type: array
+              description: Reliability bins; empty bins are omitted rather than sent as zeros.
+              items:
+                type: object
+                properties:
+                  bin_start: { type: number, format: float }
+                  bin_end: { type: number, format: float }
+                  predicted: { type: number, format: float }
+                  observed: { type: number, format: float }
+                  count: { type: integer }
+            score_distribution:
+              type: array
+              items:
+                type: object
+                properties:
+                  bin_start: { type: number, format: float }
+                  bin_end: { type: number, format: float }
+                  mid: { type: number, format: float }
+                  valid: { type: integer }
+                  invalid: { type: integer }
+            threshold_sweep:
+              type: array
+              items: { $ref: '#/components/schemas/SweepRow' }
+            per_reason:
+              type: array
+              items:
+                allOf:
+                  - $ref: '#/components/schemas/PointMetrics'
+                  - type: object
+                    properties:
+                      reason_code: { $ref: '#/components/schemas/ReasonCode' }
+                      n: { type: integer }
+                      positive_rate: { type: number, format: float }
+                      roc_auc:
+                        type: [number, 'null']
+                        format: float
+                        description: Null when the slice holds only one class -- reported as unknown rather than 0.5.
+        holdout:
+          type: object
+          description: Independent stratified 80/20 split, for a second opinion on the CV headline.
+        feature_importance:
+          type: array
+          items:
+            type: object
+            properties:
+              feature: { type: string }
+              importance:
+                type: number
+                format: float
+                description: Mean drop in ROC-AUC when this feature is shuffled.
+              std: { type: number, format: float }
+        limitations:
+          type: array
+          items: { type: string }
+          description: What these numbers do not cover, stated in the payload rather than left implicit.
 
     ValidationError:
       type: object
