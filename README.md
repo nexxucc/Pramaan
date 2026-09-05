@@ -4,14 +4,23 @@ Multi-modal chargeback/dispute evidence auditor. A vision-language model propose
 
 ## Pipeline
 
-```
-webhook → standardize → completeness pre-check → VLM propose
-        → compliance post-check → calibrator → thresholded router
-                                                      │
-                                          ┌───────────┼──────────────┐
-                                     auto_resolve  escalate    request_evidence
-                                                      │
-                                          interrupt() / human resume
+```mermaid
+flowchart TD
+    A["Webhook trigger<br/>Razorpay dispute event"] --> B["Standardize bundle<br/>Canonical typed schema"]
+    B --> C["Completeness pre-check<br/>Gate before model runs"]
+    C --> D["VLM propose<br/>Score, draft, citations"]
+    D --> E["Compliance post-check<br/>Validate citations vs evidence"]
+    E --> F["Calibrator<br/>Blend score, checks, reason code"]
+    F --> G["Thresholded router<br/>Learned thresholds"]
+    G --> H["auto_resolve<br/>Terminal"]
+    G --> I["escalate<br/>Interrupt / resume"]
+    G --> J["request_evidence<br/>Terminal, no resume"]
+
+    classDef normal fill:#1f1f1f,stroke:#aaa,color:#fff
+    classDef model fill:#6e56cf,stroke:#6e56cf,color:#fff
+
+    class A,B,C,E,G,H,J normal
+    class D,F,I model
 ```
 
 1. **Webhook trigger** — Razorpay's real `payment.dispute.created` event shape, auto-populating dispute metadata.
