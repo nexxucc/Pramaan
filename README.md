@@ -2,6 +2,10 @@
 
 Multi-modal chargeback/dispute evidence auditor. A vision-language model proposes a validity score and draft response from transaction + delivery evidence, deterministic guardrails check completeness and citation compliance, a calibrated gradient-boosting model blends everything into one score, and a thresholded router sends each case to auto-resolve, human review, or request-more-evidence.
 
+**Live API:** https://pramaan.vansh.runs-on.dev/docs (interactive Swagger docs; hosted on a free tier, so the first request after a quiet spell can take up to a minute).
+
+**Repository layout:** the pipeline and API are Python, in [`backend/`](./backend) (FastAPI + LangGraph). [`frontend/`](./frontend) is a Next.js dashboard. GitHub's language bar lists TypeScript first because it counts the frontend code.
+
 ## Pipeline
 
 ```mermaid
