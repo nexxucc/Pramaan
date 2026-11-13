@@ -7,7 +7,10 @@ from app.api.routes import disputes, metrics
 
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Pramaan — AI Risk Manager")
+app = FastAPI(
+    title="Pramaan — AI Risk Manager",
+    description="Source code: [github.com/nexxucc/Pramaan](https://github.com/nexxucc/Pramaan)",
+)
 
 app.add_middleware(
     CORSMiddleware,
